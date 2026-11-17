@@ -10,6 +10,8 @@ import asyncio
 import hashlib
 import time
 import threading
+from functools import wraps
+from urllib.parse import urlsplit
 import folder_paths
 import comfy.model_management as comfy_mm
 from aiohttp import web
@@ -34,6 +36,36 @@ HASH_READ_CHUNK_SIZE = 8 * 1024 * 1024
 WS_KEEPALIVE_INTERVAL_SECONDS = 45
 SETTINGS_FILENAME = "runpoddirect_settings.json"
 PREQUEUE_CHECK_MAX_MODELS = 512
+EXECUTABLE_SUFFIXES = ('.py', '.pyw', '.sh', '.bash', '.zsh', '.fish', '.js', '.mjs', '.cjs', '.ts', '.exe', '.bat', '.cmd', '.ps1', '.dll', '.so', '.dylib', '.jar', '.app', '.com', '.scr')
+
+
+def _is_huggingface_url(url):
+    try:
+        parsed = urlsplit(url)
+        return parsed.scheme == 'https' and parsed.hostname in ('huggingface.co', 'hf.co') and not parsed.username and not parsed.password
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_model_destination(path):
+    models_root = os.path.realpath(folder_paths.models_dir)
+    return os.path.commonpath((models_root, os.path.realpath(path))) == models_root
+
+
+def _open_download_file(path, mode):
+    """Open a download target without following a symlink at the file itself."""
+    flags = os.O_RDWR if mode == 'r+b' else os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= getattr(os, 'O_NOFOLLOW', 0)
+    return os.fdopen(os.open(path, flags, 0o644), mode)
+
+
+def _browser_only(handler):
+    @wraps(handler)
+    async def wrapped(request):
+        if request.headers.get('Sec-Fetch-Site') != 'same-origin':
+            return web.json_response({"error": "This action must be requested from the ComfyUI browser UI"}, status=403)
+        return await handler(request)
+    return wrapped
 
 _ws_keepalive_task = None
 _ws_keepalive_enabled = True
@@ -295,7 +327,7 @@ def _compute_file_hash(path, hash_type):
 
 def _cleanup_partial_file(path):
     try:
-        if path and os.path.exists(path):
+        if path and os.path.lexists(path):
             os.remove(path)
     except Exception as e:
         logging.warning(f"[RunpodDirect] Failed to remove partial file {path}: {e}")
@@ -411,6 +443,7 @@ def _verify_download_integrity(output_path, total_size, expected_hash=None, expe
 
 
 @PromptServer.instance.routes.post("/server_download/start")
+@_browser_only
 async def start_download(request):
     """Start downloading a model file to the server"""
     try:
@@ -453,6 +486,9 @@ async def start_download(request):
                 status=400
             )
 
+        if not _is_model_destination(folder_paths.folder_names_and_paths[save_path][0][0]):
+            return web.json_response({"error": "Downloads must be saved inside the models directory"}, status=400)
+
         # Security: Validate filename to prevent path traversal attacks
         # Check for any directory separators (both Unix and Windows style)
         if "/" in filename or "\\" in filename or os.path.sep in filename:
@@ -476,6 +512,9 @@ async def start_download(request):
                 status=400
             )
 
+        if safe_filename.lower().endswith(EXECUTABLE_SUFFIXES):
+            return web.json_response({"error": "Executable scripts and programs cannot be downloaded"}, status=400)
+
         # Get the first folder path for this model type
         output_dir = folder_paths.folder_names_and_paths[save_path][0][0]
         output_path = os.path.join(output_dir, safe_filename)
@@ -483,7 +522,7 @@ async def start_download(request):
         # Final security check: ensure the resolved path is within the intended directory
         output_path = os.path.abspath(output_path)
         output_dir = os.path.abspath(output_dir)
-        if not output_path.startswith(output_dir + os.sep):
+        if not output_path.startswith(output_dir + os.sep) or not _is_model_destination(output_path):
             return web.json_response(
                 {"error": "Security error: attempted directory escape"},
                 status=400
@@ -492,7 +531,7 @@ async def start_download(request):
         temp_output_path = f"{output_path}.runpoddirect.part"
 
         # If a previous session crashed mid-download, remove stale temp file and start clean.
-        if os.path.exists(temp_output_path):
+        if os.path.lexists(temp_output_path):
             _cleanup_partial_file(temp_output_path)
 
         # Check if final file already exists.
@@ -536,7 +575,7 @@ async def start_download(request):
         }
 
         # Resolve token: prefer explicit token, fall back to HF_TOKEN env var
-        resolved_token = token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        resolved_token = (token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")) if _is_huggingface_url(url) else None
 
         # Add to queue
         download_queue.append({
@@ -654,7 +693,7 @@ async def download_chunk(session, url, start, end, output_path, chunk_index, dow
             chunk_data = await response.read()
 
             # Write chunk to file at specific position
-            with open(output_path, 'r+b') as f:
+            with _open_download_file(output_path, 'r+b') as f:
                 f.seek(start)
                 f.write(chunk_data)
 
@@ -669,7 +708,7 @@ class HuggingFaceAccessError(Exception):
 
 
 def _check_hf_access(status_code, url):
-    if 'huggingface.co' not in url or status_code not in (401, 403, 451):
+    if not _is_huggingface_url(url) or status_code not in (401, 403, 451):
         return
     repo_url = url.split('/resolve/', 1)[0]
     if status_code == 401:
@@ -707,7 +746,7 @@ async def download_file(url, output_path, temp_output_path, download_id, token=N
 
         # Build auth headers for gated HF models
         auth_headers = {}
-        if token and 'huggingface.co' in url:
+        if token and _is_huggingface_url(url):
             auth_headers['Authorization'] = f'Bearer {token}'
             logging.info(f"[RunpodDirect] Using HF token for {download_id}")
 
@@ -764,7 +803,9 @@ async def download_file(url, output_path, temp_output_path, download_id, token=N
             logging.info(f"File size for {download_id}: {total_size} bytes, supports range: {supports_range}")
 
             # Create file with full size
-            with open(working_output_path, 'wb') as f:
+            if not _is_model_destination(working_output_path):
+                raise ValueError("Download destination escaped the models directory")
+            with _open_download_file(working_output_path, 'wb') as f:
                 f.seek(total_size - 1)
                 f.write(b'\0')
 
@@ -819,6 +860,8 @@ async def download_file(url, output_path, temp_output_path, download_id, token=N
             )
 
             # Atomic finalize: only move into final model path after integrity checks pass.
+            if not _is_model_destination(working_output_path) or not _is_model_destination(output_path):
+                raise ValueError("Download destination escaped the models directory")
             os.replace(working_output_path, output_path)
 
             # Mark as complete
@@ -889,7 +932,7 @@ async def download_chunk_with_progress(session, url, start, end, output_path, ch
                     if range_start > 0 and response.status == 200:
                         raise Exception(f"Server ignored range request for chunk {chunk_index} retry")
 
-                    with open(output_path, 'r+b') as f:
+                    with _open_download_file(output_path, 'r+b') as f:
                         f.seek(range_start)
                         async for chunk in response.content.iter_chunked(CHUNK_SIZE):
                             # Check if paused
@@ -964,7 +1007,7 @@ async def download_single_connection(session, url, output_path, download_id, tot
         if response.status != 200:
             raise Exception(f"HTTP {response.status}")
 
-        with open(output_path, 'wb') as f:
+        with _open_download_file(output_path, 'wb') as f:
             async for chunk in response.content.iter_chunked(CHUNK_SIZE):
                 # Check if paused
                 while download_control.get(download_id, {}).get("paused", False):
@@ -1010,6 +1053,7 @@ async def get_single_download_status(request):
 
 
 @PromptServer.instance.routes.post("/server_download/pause")
+@_browser_only
 async def pause_download(request):
     """Pause an active download"""
     try:
@@ -1042,6 +1086,7 @@ async def pause_download(request):
 
 
 @PromptServer.instance.routes.post("/server_download/resume")
+@_browser_only
 async def resume_download(request):
     """Resume a paused download"""
     try:
@@ -1074,6 +1119,7 @@ async def resume_download(request):
 
 
 @PromptServer.instance.routes.post("/server_download/cancel")
+@_browser_only
 async def cancel_download(request):
     """Cancel an active download"""
     global download_queue, current_download_task
@@ -1127,6 +1173,7 @@ async def keepalive_status(request):
 
 
 @PromptServer.instance.routes.post("/server_download/keepalive")
+@_browser_only
 async def set_keepalive_status(request):
     """Enable or disable websocket keepalive loop."""
     global _ws_keepalive_enabled
@@ -1166,6 +1213,7 @@ async def cgroup_ram_patch_status(request):
 
 
 @PromptServer.instance.routes.post("/server_download/cgroup_ram_patch")
+@_browser_only
 async def set_cgroup_ram_patch_status(request):
     """Enable or disable cgroup-aware RAM override."""
     global _cgroup_ram_patch_enabled
@@ -1224,6 +1272,7 @@ async def server_download_folder_paths(request):
 
 
 @PromptServer.instance.routes.post("/server_download/check_missing_models")
+@_browser_only
 async def check_missing_models(request):
     """Batch-check workflow models without blocking queueing on many frontend round-trips."""
     try:
@@ -1321,6 +1370,7 @@ async def check_missing_models(request):
 
 
 @PromptServer.instance.routes.post("/server_download/verify_model_integrity")
+@_browser_only
 async def verify_model_integrity(request):
     """Verify whether a model file exists and, when hash is provided, whether it matches."""
     try:
@@ -1411,6 +1461,7 @@ async def verify_model_integrity(request):
 
 
 @PromptServer.instance.routes.post("/server_download/validate_hf_token")
+@_browser_only
 async def validate_hf_token(request):
     """Validate a Hugging Face token and optionally check access to specific model URLs"""
     import aiohttp
@@ -1444,6 +1495,9 @@ async def validate_hf_token(request):
             url_access = {}
             for url in urls[:10]:  # Limit to 10 URLs
                 try:
+                    if not _is_huggingface_url(url):
+                        url_access[url] = {"accessible": False, "reason": "invalid_huggingface_url"}
+                        continue
                     async with session.head(
                         url,
                         headers={"Authorization": f"Bearer {token}"},
@@ -1493,7 +1547,7 @@ async def serve_js_with_version(request):
 WEB_DIRECTORY = "./web"
 
 # Version for cache busting - increment this when you update the JS
-__version__ = "1.0.12"
+__version__ = "1.0.13"
 
 # Apply cgroup-aware RAM patch, then load persisted settings, then start keepalive.
 _patch_comfy_ram_detection_for_cgroups()
