@@ -42,7 +42,7 @@ EXECUTABLE_SUFFIXES = ('.py', '.pyw', '.sh', '.bash', '.zsh', '.fish', '.js', '.
 def _is_huggingface_url(url):
     try:
         parsed = urlsplit(url)
-        return parsed.scheme == 'https' and parsed.hostname == 'huggingface.co' and not parsed.username and not parsed.password
+        return parsed.scheme == 'https' and parsed.hostname in ('huggingface.co', 'hf.co') and not parsed.username and not parsed.password
     except (TypeError, ValueError):
         return False
 

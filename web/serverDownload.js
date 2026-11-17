@@ -420,7 +420,7 @@ async function startServerDownload(url, savePath, filename, markAsQueued = false
         if (hash) body.hash = hash;
         if (hashType) body.hash_type = hashType;
         // Pass token for HF downloads (skip if using env var — backend reads it directly)
-        if (sessionHfToken && sessionHfToken !== '__env__' && url.includes('huggingface.co')) {
+        if (sessionHfToken && sessionHfToken !== '__env__' && isHuggingFaceUrl(url)) {
             body.token = sessionHfToken;
         }
         const response = await api.fetchApi("/server_download/start", {
@@ -1197,12 +1197,21 @@ function sanitizeUrl(rawUrl) {
     return rawUrl.trim();
 }
 
+function isHuggingFaceUrl(rawUrl) {
+    try {
+        const url = new URL(rawUrl);
+        return url.protocol === 'https:' && ['huggingface.co', 'hf.co'].includes(url.hostname) && !url.username && !url.password;
+    } catch (_e) {
+        return false;
+    }
+}
+
 function normalizeDownloadUrl(rawUrl) {
     const url = sanitizeUrl(rawUrl);
     if (!url) return '';
     try {
         const parsed = new URL(url);
-        if (parsed.hostname.includes('huggingface.co')) {
+        if (isHuggingFaceUrl(url)) {
             parsed.pathname = parsed.pathname.replace('/blob/', '/resolve/');
         }
         return parsed.toString();
@@ -3936,7 +3945,7 @@ function showDownloadBatchResult(container, button, summary) {
     // A gate may only be discovered by the download request (including in the Errors panel).
     const authFailures = retryDownloads.filter(download => {
         const error = downloadStates.get(`${download.directory}/${download.filename}`)?.error || '';
-        return download.url.includes('huggingface.co') && /Authentication required|Access denied/i.test(error);
+        return isHuggingFaceUrl(download.url) && /Authentication required|Access denied/i.test(error);
     });
     if (authFailures.length) {
         document.querySelector('.server-download-token-section')?.remove();
