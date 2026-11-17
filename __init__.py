@@ -56,13 +56,13 @@ def _open_download_file(path, mode):
     """Open a download target without following a symlink at the file itself."""
     flags = os.O_RDWR if mode == 'r+b' else os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     flags |= getattr(os, 'O_NOFOLLOW', 0)
-    return os.fdopen(os.open(path, flags, 0o600), mode)
+    return os.fdopen(os.open(path, flags, 0o644), mode)
 
 
 def _browser_only(handler):
     @wraps(handler)
     async def wrapped(request):
-        if request.headers.get('Sec-Fetch-Site') not in ('same-origin', 'same-site'):
+        if request.headers.get('Sec-Fetch-Site') != 'same-origin':
             return web.json_response({"error": "This action must be requested from the ComfyUI browser UI"}, status=403)
         return await handler(request)
     return wrapped
